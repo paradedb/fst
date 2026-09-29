@@ -21,6 +21,7 @@ const TRANS_INDEX_THRESHOLD: usize = 32;
 #[derive(Clone, Copy)]
 pub struct Node<'f> {
     data: &'f [u8],
+    offset: usize,
     version: u64,
     state: State,
     start: CompiledAddr,
@@ -55,12 +56,23 @@ impl<'f> fmt::Debug for Node<'f> {
 /// This is a free function so that we can export it to parent modules, but
 /// not to consumers of this crate.
 #[inline(always)]
-pub fn node_new(version: u64, addr: CompiledAddr, data: &[u8]) -> Node {
+pub fn node_new(version: u64, addr: CompiledAddr, data: &[u8]) -> Node<'_> {
+    node_with_offset(version, addr, data, 0)
+}
+
+#[inline(always)]
+fn node_with_offset(version: u64, addr: CompiledAddr, data: &[u8], offset: usize) -> Node<'_> {
     use self::State::*;
-    let state = State::new(data, addr);
+    let state = if addr == EMPTY_ADDRESS {
+        State::EmptyFinal
+    } else {
+        State::from_byte(data[addr - offset])
+    };
+    let addr = addr - offset;
     match state {
         EmptyFinal => Node {
             data: &[],
+            offset,
             version,
             state: State::EmptyFinal,
             start: EMPTY_ADDRESS,
@@ -74,6 +86,7 @@ pub fn node_new(version: u64, addr: CompiledAddr, data: &[u8]) -> Node {
             let data = &data[..=addr];
             Node {
                 data,
+                offset,
                 version,
                 state,
                 start: addr,
@@ -89,6 +102,7 @@ pub fn node_new(version: u64, addr: CompiledAddr, data: &[u8]) -> Node {
             let sizes = s.sizes(data);
             Node {
                 data,
+                offset,
                 version,
                 state,
                 start: addr,
@@ -105,6 +119,7 @@ pub fn node_new(version: u64, addr: CompiledAddr, data: &[u8]) -> Node {
             let ntrans = s.ntrans(data);
             Node {
                 data,
+                offset,
                 version,
                 state,
                 start: addr,
@@ -119,6 +134,35 @@ pub fn node_new(version: u64, addr: CompiledAddr, data: &[u8]) -> Node {
 }
 
 impl<'f> Node<'f> {
+    /// Decodes a node from a byte window ending at its original FST address.
+    pub fn from_bytes(version: u64, addr: CompiledAddr, data: &'f [u8]) -> Self {
+        let offset = if addr == EMPTY_ADDRESS {
+            0
+        } else {
+            addr + 1 - data.len()
+        };
+        node_with_offset(version, addr, data, offset)
+    }
+
+    /// Returns the node's encoded length from its last three bytes (or fewer).
+    pub fn encoded_len(version: u64, tail: &[u8]) -> usize {
+        match State::from_byte(*tail.last().unwrap()) {
+            State::EmptyFinal => unreachable!(),
+            State::OneTransNext(s) => 1 + s.input_len(),
+            State::OneTrans(s) => {
+                let sizes = s.sizes(tail);
+                2 + s.input_len() + sizes.transition_pack_size() + sizes.output_pack_size()
+            }
+            State::AnyTrans(s) => {
+                let sizes = s.sizes(tail);
+                let ntrans = s.ntrans(tail);
+                2 + s.ntrans_len()
+                    + s.total_trans_size(version, sizes, ntrans)
+                    + (ntrans + usize::from(s.is_final_state())) * sizes.output_pack_size()
+            }
+        }
+    }
+
     /// Returns an iterator over all transitions in this node in lexicographic
     /// order.
     #[inline]
@@ -224,7 +268,7 @@ impl<'f> Node<'f> {
     /// Return the address of this node.
     #[inline(always)]
     pub fn addr(&self) -> CompiledAddr {
-        self.start
+        self.start + self.offset
     }
 
     #[doc(hidden)]
@@ -297,12 +341,8 @@ struct StateAnyTrans(u8);
 
 impl State {
     #[inline(always)]
-    fn new(data: &[u8], addr: CompiledAddr) -> State {
+    fn from_byte(v: u8) -> State {
         use self::State::*;
-        if addr == EMPTY_ADDRESS {
-            return EmptyFinal;
-        }
-        let v = data[addr];
         match (v & 0b11_000000) >> 6 {
             0b11 => OneTransNext(StateOneTransNext(v)),
             0b10 => OneTrans(StateOneTrans(v)),
@@ -360,7 +400,7 @@ impl StateOneTransNext {
 
     #[inline(always)]
     fn trans_addr(self, node: &Node) -> CompiledAddr {
-        node.end as CompiledAddr - 1
+        node.end as CompiledAddr + node.offset - 1
     }
 }
 
@@ -454,7 +494,7 @@ impl StateOneTrans {
                 - self.input_len()
                 - 1 // pack size
                 - tsize;
-        unpack_delta(&node.data[i..], tsize, node.end)
+        unpack_delta(&node.data[i..], tsize, node.end + node.offset)
     }
 }
 
@@ -639,7 +679,7 @@ impl StateAnyTrans {
                  - node.ntrans // inputs
                  - (i * tsize) // the previous transition addresses
                  - tsize; // the desired transition address
-        unpack_delta(&node.data[at..], tsize, node.end)
+        unpack_delta(&node.data[at..], tsize, node.end + node.offset)
     }
 
     #[inline(always)]
