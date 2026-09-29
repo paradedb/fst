@@ -43,6 +43,7 @@ mod error;
 mod node;
 mod ops;
 mod pack;
+pub mod paged;
 mod registry;
 mod registry_minimal;
 #[cfg(test)]
