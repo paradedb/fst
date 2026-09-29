@@ -35,8 +35,14 @@ impl<R: ReadBytes> PagedFst<R> {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated FST"));
         }
         let header = reader.read_bytes(0..HEADER_LEN)?;
-        let version = u64::from_le_bytes(header[..8].try_into().unwrap());
         let footer = reader.read_bytes(size - FOOTER_LEN..size)?;
+        if header.len() != HEADER_LEN || footer.len() != FOOTER_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "incomplete FST header or footer",
+            ));
+        }
+        let version = u64::from_le_bytes(header[..8].try_into().unwrap());
         let len = u64::from_le_bytes(footer[..8].try_into().unwrap());
         let root = usize::try_from(u64::from_le_bytes(footer[8..].try_into().unwrap()))
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid FST root"))?;
@@ -62,6 +68,12 @@ impl<R: ReadBytes> PagedFst<R> {
         if addr == EMPTY_ADDRESS {
             return Ok(visit(Node::from_bytes(self.version, addr, &[])));
         }
+        if addr < HEADER_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid FST node address",
+            ));
+        }
         let end = addr
             .checked_add(1)
             .filter(|end| *end <= self.reader.num_bytes())
@@ -71,9 +83,11 @@ impl<R: ReadBytes> PagedFst<R> {
         let tail = self
             .reader
             .read_bytes(end.saturating_sub(NODE_HEADER_LEN)..end)?;
-        let len = Node::encoded_len(self.version, &tail);
+        let len = Node::encoded_len(self.version, &tail)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid FST node header"))?;
         let start = end
             .checked_sub(len)
+            .filter(|&start| start >= HEADER_LEN)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid FST node size"))?;
         if len <= tail.len() {
             return Ok(visit(Node::from_bytes(
@@ -97,16 +111,11 @@ impl<R: ReadBytes> PagedFst<R> {
         for &byte in key {
             let (equal, greater) = self.with_node(addr, |node| {
                 let equal = node.find_input(byte);
-                let greater = equal
-                    .map(|i| i + 1)
-                    .filter(|&i| i < node.len())
-                    .or_else(|| {
-                        if equal.is_none() {
-                            node.transitions().position(|t| t.inp > byte)
-                        } else {
-                            None
-                        }
-                    });
+                let greater = match equal {
+                    Some(i) if i + 1 < node.len() => Some(i + 1),
+                    Some(_) => None,
+                    None => node.transitions().position(|t| t.inp > byte),
+                };
                 (
                     equal.map(|i| node.transition(i)),
                     greater.map(|i| node.transition(i)),
@@ -252,10 +261,6 @@ mod tests {
             25000
         );
         let bytes: usize = source.reads.borrow().iter().map(|r| r.len()).sum();
-        println!(
-            "FST {} bytes; open + lookup read {bytes} bytes",
-            source.num_bytes()
-        );
         assert!(bytes < source.num_bytes() / 100);
     }
 }

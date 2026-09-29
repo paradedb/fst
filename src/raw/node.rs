@@ -34,8 +34,8 @@ pub struct Node<'f> {
 
 impl<'f> fmt::Debug for Node<'f> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        writeln!(f, "NODE@{}", self.start)?;
-        writeln!(f, "  end_addr: {}", self.end)?;
+        writeln!(f, "NODE@{}", self.addr())?;
+        writeln!(f, "  end_addr: {}", self.end + self.offset)?;
         writeln!(f, "  size: {} bytes", self.as_slice().len())?;
         writeln!(f, "  state: {:?}", self.state)?;
         writeln!(f, "  is_final: {}", self.is_final())?;
@@ -135,30 +135,41 @@ fn node_with_offset(version: u64, addr: CompiledAddr, data: &[u8], offset: usize
 
 impl<'f> Node<'f> {
     /// Decodes a node from a byte window ending at its original FST address.
-    pub fn from_bytes(version: u64, addr: CompiledAddr, data: &'f [u8]) -> Self {
+    pub(crate) fn from_bytes(version: u64, addr: CompiledAddr, data: &'f [u8]) -> Self {
         let offset = if addr == EMPTY_ADDRESS {
             0
         } else {
-            addr + 1 - data.len()
+            addr.checked_add(1)
+                .and_then(|end| end.checked_sub(data.len()))
+                .unwrap_or(0)
         };
         node_with_offset(version, addr, data, offset)
     }
 
-    /// Returns the node's encoded length from its last three bytes (or fewer).
-    pub fn encoded_len(version: u64, tail: &[u8]) -> usize {
-        match State::from_byte(*tail.last().unwrap()) {
+    /// Returns the node's encoded length from its trailing header bytes (up to 3 bytes).
+    pub(crate) fn encoded_len(version: u64, tail: &[u8]) -> Option<usize> {
+        let last = *tail.last()?;
+        match State::from_byte(last) {
             State::EmptyFinal => unreachable!(),
-            State::OneTransNext(s) => 1 + s.input_len(),
+            State::OneTransNext(s) => Some(1 + s.input_len()),
             State::OneTrans(s) => {
+                if tail.len() < 2 + s.input_len() {
+                    return None;
+                }
                 let sizes = s.sizes(tail);
-                2 + s.input_len() + sizes.transition_pack_size() + sizes.output_pack_size()
+                Some(2 + s.input_len() + sizes.transition_pack_size() + sizes.output_pack_size())
             }
             State::AnyTrans(s) => {
+                if tail.len() < 2 + s.ntrans_len() {
+                    return None;
+                }
                 let sizes = s.sizes(tail);
                 let ntrans = s.ntrans(tail);
-                2 + s.ntrans_len()
-                    + s.total_trans_size(version, sizes, ntrans)
-                    + (ntrans + usize::from(s.is_final_state())) * sizes.output_pack_size()
+                Some(
+                    2 + s.ntrans_len()
+                        + s.total_trans_size(version, sizes, ntrans)
+                        + (ntrans + usize::from(s.is_final_state())) * sizes.output_pack_size(),
+                )
             }
         }
     }
